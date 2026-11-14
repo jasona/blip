@@ -7,8 +7,10 @@ function markSendFailed(items, id, reason, fallback) {
 function sendServiceArg(chat, group, listService, loadedChat, loadedService) {
   if (group)
     return "";
-  const svc = loadedChat === chat && loadedService !== "" ? loadedService : listService;
-  return /^(SMS|RCS)$/i.test(svc) ? svc.toUpperCase() : "";
+  const svc = (loadedChat === chat && loadedService !== "" ? loadedService : listService).toUpperCase();
+  if (svc === "RCS")
+    return svc;
+  return svc === "SMS" && /^\+?[0-9]{3,15}$/.test(chat) ? svc : "";
 }
 function friendlySendError(raw) {
   return /(^|[^\d])-10810(\D|$)/.test(raw) ? "Messages can't start on the Mac: nobody is logged in there. Log in on the Mac, then send again." : raw;

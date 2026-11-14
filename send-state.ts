@@ -19,7 +19,10 @@ export function markSendFailed<T extends LocalSend>(items: T[], id: string, reas
  *  The opened conversation's own rows (thread.ts `service`, kept with the chat
  *  they were loaded for) outrank the list row's service. That is the Mac's chat
  *  label, which follows the Mac's own last send and stayed "iMessage" for a
- *  contact texting on RCS, so every send failed with error 22 (2026-11-12). */
+ *  contact texting on RCS, so every send failed with error 22 (2026-11-12).
+ *  An address that is not a phone number never carries SMS, whatever the label
+ *  says (#165 review). RCS stays open to it: business agents text from
+ *  `name@rbm.goog`, and their labels say RCS. */
 export function sendServiceArg(
   chat: string,
   group: boolean,
@@ -28,8 +31,9 @@ export function sendServiceArg(
   loadedService: string,
 ): string {
   if (group) return "";
-  const svc = loadedChat === chat && loadedService !== "" ? loadedService : listService;
-  return /^(SMS|RCS)$/i.test(svc) ? svc.toUpperCase() : "";
+  const svc = (loadedChat === chat && loadedService !== "" ? loadedService : listService).toUpperCase();
+  if (svc === "RCS") return svc;
+  return svc === "SMS" && /^\+?[0-9]{3,15}$/.test(chat) ? svc : "";
 }
 
 /** Say what a send failure MEANS when the Mac's own words are only a number.

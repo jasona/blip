@@ -662,10 +662,18 @@ export type SendService = "iMessage" | "SMS" | "RCS";
  * receipt 1 to 6 seconds after it was sent. A read receipt is the recipient's
  * own device saying the message arrived, so it outranks the error. Carrier SMS
  * has no receipts, so this clears only a row that provably got through.
- * `read_at` comes with `--rich` fetches; a plain fetch keeps the old rule.
+ *
+ * The exception is exactly that case: an SMS or RCS row in a 1:1. An iMessage
+ * row keeps the Mac's verdict, because a failed edit of a message already read
+ * carries both an error and a receipt. So does any group row, because one
+ * member's receipt says nothing about the others. `read_at` comes only with
+ * `--rich` fetches. The collector's plain `recent` rows never carry it, so its
+ * failure toast still fires for a relayed SMS (`selectFailures`).
  */
 export function sendFailed(m: ImsgMessage): boolean {
-  return m.from_me === true && typeof m.error === "number" && m.error !== 0 && !m.read_at;
+  if (m.from_me !== true || typeof m.error !== "number" || m.error === 0) return false;
+  const relayed = !isGroupChat(chatKey(m)) && normalizeSendService(m.service) !== "iMessage";
+  return !(relayed && m.read_at);
 }
 
 /** Map a chat.db service string onto what `imsg-send --service` accepts. */
@@ -695,22 +703,47 @@ export function normalizeSendService(raw: string | undefined | null): SendServic
  *      the loaded window (in or out) → iMessage. Last-inbound RCS/SMS in a
  *      mixed 1:1 otherwise makes the next send green, and the Mac records SMS
  *      error 4 while the iPhone still delivers. Off by default.
- *   3. otherwise the last INBOUND service: that is what they actually reach
+ *   3. the newest of our sends that provably reached them (delivered, or
+ *      read) is an iMessage newer than anything they sent → iMessage. Their
+ *      last text can be an SMS from long ago in a quiet DM that is blue now.
+ *      Only iMessage and RCS rows get `delivered`, and an error-22 row is
+ *      never delivered, so this cannot reopen the #151 loop. It needs
+ *      `--rich` rows (thread loads). The collector's window never qualifies.
+ *   4. otherwise the last INBOUND service: that is what they actually reach
  *      us on, and a failed outbound must never override it.
- *   4. no inbound at all → the last outbound that SUCCEEDED.
- *   5. nothing to go on → iMessage, like a fresh conversation.
+ *   5. no inbound at all → the last outbound that SUCCEEDED.
+ *   6. nothing to go on → iMessage, like a fresh conversation.
  * Groups send `--chat-id` and ignore all of this.
+ *
+ * `target` is the id the send goes `--to`. Only rows under that id decide.
+ * A merged phone + email conversation carries both handles' rows, and the
+ * phone's SMS once sent SMS to the email (#165 review). An address that is
+ * not a phone number never gets SMS. It gets RCS only when that same address
+ * reached us on RCS, as a business agent (`name@rbm.goog`) does.
  */
-export function sendServiceForMessages(msgs: ImsgMessage[], preferImessage = false): SendService {
-  if (!msgs.length) return "iMessage";
-  const sorted = [...msgs].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+export function sendServiceForMessages(
+  msgs: ImsgMessage[],
+  preferImessage = false,
+  target?: string,
+): SendService {
+  const rows = target === undefined ? msgs : msgs.filter((m) => chatKey(m) === target);
+  if (!rows.length) return "iMessage";
+  const sorted = [...rows].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  const chat = target ?? chatKey(sorted[sorted.length - 1]);
+  const svc = decideSendService(sorted, preferImessage, chat);
+  if (svc === "iMessage" || /^\+?[0-9]{3,15}$/.test(chat)) return svc;
+  const theyUseRcs = sorted.some((m) => !m.from_me && chatKey(m) === chat && normalizeSendService(m.service) === "RCS");
+  return svc === "RCS" && theyUseRcs ? "RCS" : "iMessage";
+}
+
+/** The rules above over one handle's rows, sorted oldest first. */
+function decideSendService(sorted: ImsgMessage[], preferImessage: boolean, chat: string): SendService {
   let lastInbound: ImsgMessage | undefined;
   for (let i = sorted.length - 1; i >= 0 && !lastInbound; i--) {
     if (!sorted[i]!.from_me) lastInbound = sorted[i];
   }
 
   const newest = sorted[sorted.length - 1]!;
-  const chat = chatKey(newest);
   if (newest.from_me && sendFailed(newest)
       && normalizeSendService(newest.service) === "iMessage"
       && /^\+?[0-9]{3,15}$/.test(chat)) {
@@ -721,6 +754,13 @@ export function sendServiceForMessages(msgs: ImsgMessage[], preferImessage = fal
     for (const m of sorted) {
       if (!sendFailed(m) && normalizeSendService(m.service) === "iMessage") return "iMessage";
     }
+  }
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const m = sorted[i]!;
+    if (lastInbound && m.ts <= lastInbound.ts) break;
+    if (!m.from_me || sendFailed(m) || !(m.delivered === true || m.read_at)) continue;
+    if (normalizeSendService(m.service) === "iMessage") return "iMessage";
+    break;
   }
   if (lastInbound) return normalizeSendService(lastInbound.service);
   for (let i = sorted.length - 1; i >= 0; i--) {
@@ -782,7 +822,7 @@ export function buildThreads(
       guid: isGroupChat(chat) ? groups[chat]?.guid ?? "" : "",
       name: isGroupChat(chat) ? groupName(chat, groups[chat], byHandle) : displayName(sorted),
       handle: String(last.handle || chat),
-      service: isGroupChat(chat) ? last.service : sendServiceForMessages(sorted, preferImessage),
+      service: isGroupChat(chat) ? last.service : sendServiceForMessages(sorted, preferImessage, chat),
       last_ts: last.ts,
       last_text: messagePreview(last.text, last.attachments?.[0]),
       last_from_me: last.from_me,
@@ -1357,6 +1397,9 @@ export function selectFailures(
   const out: Toast[] = [];
   const cutoff = nowTs(new Date(Date.parse(now) - FAILURE_TOAST_WINDOW_MS));
   for (const m of msgs) {
+    // A read receipt clears a relayed SMS (`sendFailed`), but these rows come
+    // from a plain `recent` fetch, which carries no `read_at`. So this toast
+    // still fires for an SMS the iPhone delivered anyway.
     if (!sendFailed(m)) continue;
     if (m.ts < cutoff) continue;
     const key = "fail:" + toastKey(m);
@@ -2126,8 +2169,15 @@ export function foldThreadAliases(threads: Thread[], aliases: Record<string, str
   if (Object.keys(aliases).length === 0) return threads;
   const out: Thread[] = [];
   const at = new Map<string, number>();
+  // A DM sends `--to <canonical>`, so only the canonical's own rows may name
+  // its service. An alias's rows belong to the other handle of a merged
+  // phone + email conversation and say nothing about this one (#165 review).
+  // With no rows of its own, the service is "", and mergeChats falls back to
+  // the list's label.
+  const own = new Map<string, string>();
   for (const t of threads) {
     const canon = aliases[t.chat] ?? t.chat;
+    if (t.chat === canon) own.set(canon, t.service);
     const seen = at.get(canon);
     if (seen === undefined) {
       at.set(canon, out.length);
@@ -2144,7 +2194,11 @@ export function foldThreadAliases(threads: Thread[], aliases: Record<string, str
       unread: prev.unread + t.unread,
     };
   }
-  return out;
+  return out.map((t) => {
+    if (isGroupChat(t.chat)) return t;
+    const service = own.get(t.chat) ?? "";
+    return service === t.service ? t : { ...t, service };
+  });
 }
 
 /** Same fold for a per-chat ledger (unread counts, oldest-unread stamps). */
@@ -2214,9 +2268,10 @@ export function mergeChats(
     // contact texting on RCS stayed labelled iMessage, and every send failed
     // with error 22. Another stayed labelled SMS and got plain SMS, logged
     // error 4 (2026-11-12). The label now names a DM only when the window has
-    // no rows for it (the quiet rows below), and BlipView replaces even that
-    // with the opened conversation's own rows (thread.ts `service`). A group
-    // sends by chat id, so the label stays its name.
+    // no rows under its own id (the quiet rows below, or a merged conversation
+    // whose rows are all the alias's, left "" by foldThreadAliases). BlipView
+    // replaces even that with the opened conversation's own rows (thread.ts
+    // `service`). A group sends by chat id, so the label stays its name.
     const listService = info.service || thread.service;
     return {
       ...thread,
@@ -2229,7 +2284,7 @@ export function mergeChats(
               ? groupName(thread.chat, groupInfo, knownParticipantNames)
               : namedGroup(thread.name, thread.chat, aliases) || thread.chat))
         : (info.last_name || info.name || thread.name || thread.chat),
-      service: group ? listService : thread.service,
+      service: group ? listService : thread.service || listService,
       last_text: info.last === thread.last_ts ? info.last_text : messagePreview(thread.last_text),
       pinned,
       pin_order,

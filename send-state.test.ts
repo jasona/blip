@@ -126,6 +126,16 @@ test("a send uses the opened conversation's own service over the list label", ()
   expect(sendServiceArg(chat, false, "iMessage", "", "")).toBe("");
 });
 
+// #165 review: a merged phone + email conversation could hand an email address SMS.
+test("an address that is not a phone number never carries SMS", () => {
+  expect(sendServiceArg("pat@example.com", false, "SMS", "", "")).toBe("");
+  expect(sendServiceArg("pat@example.com", false, "iMessage", "pat@example.com", "SMS")).toBe("");
+  // an RCS business agent texts from an address, and its label says RCS
+  expect(sendServiceArg("verify_agent@rbm.goog", false, "RCS", "", "")).toBe("RCS");
+  // short codes are numbers
+  expect(sendServiceArg("99123", false, "SMS", "", "")).toBe("SMS");
+});
+
 test("a group never carries --service: it sends by chat id", () => {
   const id = "abcdef0123456789abcdef0123456789";
   expect(sendServiceArg(id, true, "RCS", id, "RCS")).toBe("");
@@ -136,5 +146,6 @@ test("the deployed QML module picks the same service as the TypeScript", async (
   for (const args of [
     ["+1", false, "iMessage", "+1", "RCS"], ["+1", false, "SMS", "+2", "RCS"],
     ["+1", true, "SMS", "+1", "SMS"], ["+1", false, "rcs", "", ""],
+    ["pat@example.com", false, "SMS", "", ""], ["a@rbm.goog", false, "RCS", "", ""],
   ] as const) expect(runtime.sendServiceArg(...args)).toBe(sendServiceArg(...args));
 });

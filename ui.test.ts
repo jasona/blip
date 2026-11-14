@@ -1165,19 +1165,20 @@ describe("a message can carry several files (multi-file drafts)", () => {
 describe("a DM sends on its own rows, not the Mac's chat label", () => {
   // 2026-11-12: root.active.service is the list row's service, the Mac's label
   // for the chat. It stayed "iMessage" for a contact texting on RCS.
-  test("the loader keeps thread.ts's service with the chat it was loaded for", () => {
+  // What these functions DO is run for real by scripts/test-send-service-ui.py
+  // (QtTest, the shipping functions, the real SendState.mjs). These checks pin
+  // only that the loader and send() go through them.
+  test("the loader hands thread.ts's service to noteThreadService with the chat it loaded", () => {
     const load = panel.slice(panel.indexOf("id: threadProc"), panel.indexOf("onExited", panel.indexOf("id: threadProc")));
-    expect(load).toContain("root.threadSendServiceChat = root.threadRunningChat");
-    expect(load).toContain('root.threadSendService = String(d.service || "")');
-    // set before the unchanged-snapshot early return, which skips the rest
-    expect(load.indexOf("root.threadSendService =")).toBeLessThan(load.indexOf("if (j === root.bubblesJson)"));
+    expect(load).toContain("root.noteThreadService(root.threadRunningChat, d.service)");
+    // before the unchanged-snapshot early return, which skips the rest
+    expect(load.indexOf("root.noteThreadService(")).toBeLessThan(load.indexOf("if (j === root.bubblesJson)"));
   });
 
-  test("text and file sends both ask SendState.sendServiceArg", () => {
+  test("text and file sends both ask sendServiceFor, never the label directly", () => {
     const send = panel.slice(panel.indexOf("function send()"), panel.indexOf("function wireStamp"));
-    expect(send.match(/SendState\.sendServiceArg\(/g)?.length).toBe(2);
-    // ...and both hand it the rows' service, or the label decides again
-    expect(send.match(/root\.threadSendServiceChat, root\.threadSendService\)/g)?.length).toBe(2);
+    expect(send.match(/root\.sendServiceFor\(/g)?.length).toBe(2);
+    expect(send).not.toContain("root.active.service");
     expect(send).not.toMatch(/test\(svc\)/);
   });
 });
